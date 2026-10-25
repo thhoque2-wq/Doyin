@@ -151,6 +151,15 @@ jobs:
           import android.provider.MediaStore
           import android.view.View
           import android.webkit.MimeTypeMap
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.os.Handler
+          import android.os.Looper
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
+          import java.util.concurrent.atomic.AtomicReference
           import android.widget.Button
           import android.widget.EditText
           import android.widget.LinearLayout
@@ -184,6 +193,7 @@ jobs:
                   val bg = Color.parseColor("#020617")
                   window.statusBarColor = bg
                   window.navigationBarColor = bg
+                  java.net.CookieHandler.setDefault(java.net.CookieManager())
 
                   val col = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
@@ -351,7 +361,7 @@ jobs:
                   return Pair(body, c.url.toString())
               }
 
-              private fun downloadTo(urlStr: String, out: File) {
+              private fun downloadTo(urlStr: String, out: File, cookie: String? = null) {
                   var cur = urlStr
                   for (i in 0 until 6) {
                       val c = URL(cur).openConnection() as HttpURLConnection
@@ -360,6 +370,7 @@ jobs:
                       c.readTimeout = 30000
                       c.setRequestProperty("User-Agent", mobileUa)
                       c.setRequestProperty("Referer", "https://www.douyin.com/")
+                      if (!cookie.isNullOrBlank()) c.setRequestProperty("Cookie", cookie)
                       val code = c.responseCode
                       if (code in 300..399) {
                           val loc = c.getHeaderField("Location") ?: throw Exception("Bad redirect from Douyin server.")
@@ -374,39 +385,125 @@ jobs:
                   throw Exception("Too many redirects.")
               }
 
-              // Douyin: read the public share page (the page the Douyin app opens) and take the no-watermark file.
+              // Douyin, three attempts: share page -> item API -> hidden browser that sniffs the video address.
+              private var douyinNote = ""
+
+              private fun itemFromSharePage(id: String): JSONObject? = try {
+                  val html = httpGet("https://www.iesdouyin.com/share/video/$id").first
+                  val m = Regex("window\\._ROUTER_DATA\\s*=\\s*(.*?)</script>", RegexOption.DOT_MATCHES_ALL).find(html)
+                  if (m == null) {
+                      douyinNote += " [share page: no data block, ${html.length} bytes]"
+                      null
+                  } else {
+                      val loader = JSONObject(m.groupValues[1].trim().trimEnd(';')).getJSONObject("loaderData")
+                      var found: JSONObject? = null
+                      for (k in loader.keys()) {
+                          val info = loader.optJSONObject(k)?.optJSONObject("videoInfoRes") ?: continue
+                          val list = info.optJSONArray("item_list")
+                          if (list != null && list.length() > 0) { found = list.getJSONObject(0); break }
+                          val why = info.optJSONArray("filter_list")?.optJSONObject(0)
+                          douyinNote += " [share page empty: " + (why?.optString("detail_msg").orEmpty().ifBlank { why?.optString("filter_reason").orEmpty() }) + "]"
+                      }
+                      if (found == null && douyinNote.isBlank()) {
+                          douyinNote += " [share page keys: " + loader.keys().asSequence().joinToString(",") + "]"
+                      }
+                      found
+                  }
+              } catch (e: Exception) {
+                  douyinNote += " [share page error: ${e.message}]"
+                  null
+              }
+
+              private fun itemFromApi(id: String): JSONObject? = try {
+                  val c = URL("https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids=$id").openConnection() as HttpURLConnection
+                  c.connectTimeout = 15000
+                  c.readTimeout = 20000
+                  c.setRequestProperty("User-Agent", mobileUa)
+                  c.setRequestProperty("Referer", "https://www.iesdouyin.com/share/video/$id/")
+                  val body = c.inputStream.bufferedReader().use { it.readText() }
+                  val list = JSONObject(body).optJSONArray("item_list")
+                  if (list != null && list.length() > 0) list.getJSONObject(0) else { douyinNote += " [api empty]"; null }
+              } catch (e: Exception) {
+                  douyinNote += " [api error: ${e.message}]"
+                  null
+              }
+
+              private fun sniffWithWebView(id: String): String? {
+                  val latch = CountDownLatch(1)
+                  val ref = AtomicReference<String?>(null)
+                  var web: WebView? = null
+                  runOnUiThread {
+                      val w = WebView(this)
+                      web = w
+                      w.settings.javaScriptEnabled = true
+                      w.settings.domStorageEnabled = true
+                      w.settings.userAgentString = mobileUa
+                      w.settings.mediaPlaybackRequiresUserGesture = false
+                      val handler = Handler(Looper.getMainLooper())
+                      var polls = 0
+                      val poll = object : Runnable {
+                          override fun run() {
+                              if (ref.get() != null || polls++ > 20) return
+                              w.evaluateJavascript("(function(){var e=document.querySelector('video');return e?(e.currentSrc||e.src||''):''})()") { s ->
+                                  val u = (s ?: "").trim('"').replace("\\u002F", "/")
+                                  if (u.startsWith("http") && ref.compareAndSet(null, u)) latch.countDown()
+                              }
+                              handler.postDelayed(this, 1000)
+                          }
+                      }
+                      w.webViewClient = object : WebViewClient() {
+                          override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest): WebResourceResponse? {
+                              val u = r.url.toString()
+                              if (u.contains("/aweme/v1/play") || u.contains("douyinvod.com") || u.contains("/video/tos/")) {
+                                  if (ref.compareAndSet(null, u)) latch.countDown()
+                              }
+                              return null
+                          }
+                          override fun onPageFinished(v: WebView, url: String) {
+                              handler.post(poll)
+                          }
+                      }
+                      w.loadUrl("https://www.iesdouyin.com/share/video/$id")
+                  }
+                  latch.await(25, TimeUnit.SECONDS)
+                  runOnUiThread { web?.destroy() }
+                  return ref.get()
+              }
+
               private fun fetchDouyin(url: String, dir: File, wantAudio: Boolean) {
+                  douyinNote = ""
                   val idRegex = Regex("/(?:video|note)/(\\d+)")
                   val id = idRegex.find(url)?.groupValues?.get(1)
                       ?: idRegex.find(httpGet(url).second)?.groupValues?.get(1)
                       ?: throw Exception("Could not find the video id in this Douyin link.")
-                  val html = httpGet("https://www.iesdouyin.com/share/video/$id").first
-                  val m = Regex("window\\._ROUTER_DATA\\s*=\\s*(.*?)</script>", RegexOption.DOT_MATCHES_ALL).find(html)
-                      ?: throw Exception("Douyin page format not recognised. The site may have changed or blocked this request.")
-                  val loader = JSONObject(m.groupValues[1].trim().trimEnd(';')).getJSONObject("loaderData")
-                  var item: JSONObject? = null
-                  for (k in loader.keys()) {
-                      val info = loader.optJSONObject(k)?.optJSONObject("videoInfoRes") ?: continue
-                      val list = info.optJSONArray("item_list") ?: continue
-                      if (list.length() > 0) { item = list.getJSONObject(0); break }
-                  }
-                  val data = item ?: throw Exception("No video data found. It may be a private video or blocked.")
-                  val title = data.optString("desc").ifBlank { "douyin_$id" }
-                      .replace(Regex("[\\\\/:*?\"<>|\\r\\n]"), "_").take(60)
 
-                  var mediaUrl: String? = null
-                  var ext = "mp4"
-                  if (wantAudio) {
-                      mediaUrl = data.optJSONObject("music")?.optJSONObject("play_url")?.optJSONArray("url_list")?.optString(0)
-                      if (!mediaUrl.isNullOrBlank()) ext = "mp3"
+                  val data = itemFromSharePage(id) ?: itemFromApi(id)
+                  if (data != null) {
+                      val title = data.optString("desc").ifBlank { "douyin_$id" }
+                          .replace(Regex("[\\\\/:*?\"<>|\\r\\n]"), "_").take(60)
+                      var mediaUrl: String? = null
+                      var ext = "mp4"
+                      if (wantAudio) {
+                          mediaUrl = data.optJSONObject("music")?.optJSONObject("play_url")?.optJSONArray("url_list")?.optString(0)
+                          if (!mediaUrl.isNullOrBlank()) ext = "mp3"
+                      }
+                      if (mediaUrl.isNullOrBlank()) {
+                          val list = data.optJSONObject("video")?.optJSONObject("play_addr")?.optJSONArray("url_list")
+                              ?: throw Exception("This post has no video (image posts are not supported).")
+                          mediaUrl = list.getString(0).replace("playwm", "play")
+                          ext = "mp4"
+                      }
+                      downloadTo(mediaUrl!!, File(dir, "$title.$ext"))
+                      return
                   }
-                  if (mediaUrl.isNullOrBlank()) {
-                      val list = data.optJSONObject("video")?.optJSONObject("play_addr")?.optJSONArray("url_list")
-                          ?: throw Exception("This post has no video (image posts are not supported).")
-                      mediaUrl = list.getString(0).replace("playwm", "play")
-                      ext = "mp4"
+
+                  val sniffed = sniffWithWebView(id)
+                  if (sniffed != null) {
+                      val cookie = android.webkit.CookieManager.getInstance().getCookie(sniffed)
+                      downloadTo(sniffed.replace("playwm", "play"), File(dir, "douyin_$id.mp4"), cookie)
+                      return
                   }
-                  downloadTo(mediaUrl!!, File(dir, "$title.$ext"))
+                  throw Exception("No video data found.$douyinNote [browser: no video address seen]")
               }
 
               private fun saveToDownloads(f: File) {
