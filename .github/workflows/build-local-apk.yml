@@ -1,0 +1,453 @@
+name: Build Local Downloader APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+env:
+  APP_NAME: "Video Downloader"
+  # youtubedl-android library version (Maven Central). Change only if the build says it cannot be found.
+  YTDL_VERSION: "0.17.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Generate Android project
+        run: |
+          mkdir -p proj/app/src/main/java/com/example/localdl proj/app/src/main/res/values proj/app/src/main/res/drawable
+          cd proj
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "LocalDownloader"
+          include ":app"
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '2.0.21' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.example.localdl'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.example.localdl'
+                  minSdk 29
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+                  ndk { abiFilters 'arm64-v8a' }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+
+              packagingOptions {
+                  jniLibs { useLegacyPackaging true }
+                  resources { pickFirsts += ['META-INF/**'] }
+              }
+          }
+
+          dependencies {
+              def v = System.getenv('YTDL_VERSION') ?: '0.17.2'
+              implementation "io.github.junkfood02.youtubedl-android:library:${v}"
+              implementation "io.github.junkfood02.youtubedl-android:ffmpeg:${v}"
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@drawable/ic_launcher"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+                  android:usesCleartextTraffic="true"
+                  android:largeHeap="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">__APP_NAME__</string>
+          </resources>
+          EOF
+          sed -i "s|__APP_NAME__|$APP_NAME|" app/src/main/res/values/strings.xml
+
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#D946EF"
+                  android:pathData="M54,54m-50,0a50,50 0 1,1 100,0a50,50 0 1,1 -100,0" />
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M48,28h12v24h12L54,74L36,52h12z" />
+          </vector>
+          EOF
+
+          cat > app/src/main/java/com/example/localdl/MainActivity.kt <<'EOF'
+          package com.example.localdl
+
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.os.Environment
+          import android.provider.MediaStore
+          import android.view.View
+          import android.webkit.MimeTypeMap
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.RadioButton
+          import android.widget.RadioGroup
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import com.yausername.ffmpeg.FFmpeg
+          import com.yausername.youtubedl_android.YoutubeDL
+          import com.yausername.youtubedl_android.YoutubeDLRequest
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import org.json.JSONObject
+
+          class MainActivity : Activity() {
+              private lateinit var input: EditText
+              private lateinit var status: TextView
+              private lateinit var bar: ProgressBar
+              private lateinit var go: Button
+              private lateinit var upd: Button
+              private lateinit var audio: RadioButton
+              @Volatile private var ready = false
+              @Volatile private var busy = false
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val bg = Color.parseColor("#020617")
+                  window.statusBarColor = bg
+                  window.navigationBarColor = bg
+
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(40), dp(20), dp(24))
+                  }
+                  col.addView(TextView(this).apply {
+                      text = "Video Downloader"
+                      textSize = 28f
+                      setTextColor(Color.WHITE)
+                  })
+                  col.addView(TextView(this).apply {
+                      text = "Paste a link (Douyin, TikTok, YouTube, Facebook...) or share a video to this app. Everything runs on your phone."
+                      textSize = 14f
+                      setTextColor(Color.parseColor("#94A3B8"))
+                      setPadding(0, dp(8), 0, dp(20))
+                  })
+
+                  input = EditText(this).apply {
+                      hint = "Paste link here..."
+                      setHintTextColor(Color.parseColor("#64748B"))
+                      setTextColor(Color.WHITE)
+                      setBackgroundColor(Color.parseColor("#0F172A"))
+                      setPadding(dp(14), dp(14), dp(14), dp(14))
+                      maxLines = 3
+                  }
+                  col.addView(input, LinearLayout.LayoutParams(-1, -2))
+
+                  val group = RadioGroup(this).apply {
+                      orientation = RadioGroup.HORIZONTAL
+                      setPadding(0, dp(12), 0, dp(12))
+                  }
+                  val video = RadioButton(this).apply {
+                      text = "Video (MP4)"; setTextColor(Color.WHITE); isChecked = true; id = View.generateViewId()
+                  }
+                  audio = RadioButton(this).apply {
+                      text = "Audio (MP3)"; setTextColor(Color.WHITE); id = View.generateViewId()
+                  }
+                  group.addView(video)
+                  group.addView(audio)
+                  col.addView(group)
+
+                  go = Button(this).apply {
+                      text = "Download"
+                      setTextColor(Color.WHITE)
+                      setBackgroundColor(Color.parseColor("#D946EF"))
+                      setOnClickListener { startDownload() }
+                  }
+                  col.addView(go, LinearLayout.LayoutParams(-1, dp(52)))
+
+                  bar = ProgressBar(this).apply { visibility = View.GONE }
+                  col.addView(bar, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(16) })
+
+                  status = TextView(this).apply {
+                      text = "Preparing engine (first launch takes a few seconds)..."
+                      setTextColor(Color.parseColor("#CBD5E1"))
+                      setPadding(0, dp(16), 0, dp(16))
+                  }
+                  col.addView(status)
+
+                  upd = Button(this).apply {
+                      text = "Update yt-dlp (do this if downloads fail)"
+                      setTextColor(Color.WHITE)
+                      setBackgroundColor(Color.parseColor("#334155"))
+                      setOnClickListener { startUpdate() }
+                  }
+                  col.addView(upd, LinearLayout.LayoutParams(-1, dp(48)))
+
+                  setContentView(ScrollView(this).apply { setBackgroundColor(bg); addView(col) })
+                  handleShare(intent)
+
+                  Thread {
+                      try {
+                          YoutubeDL.getInstance().init(applicationContext)
+                          FFmpeg.getInstance().init(applicationContext)
+                          ready = true
+                          say("Ready. Paste a link and press Download.")
+                      } catch (e: Exception) {
+                          say("Engine failed to start: " + (e.message ?: e.toString()))
+                      }
+                  }.start()
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  handleShare(intent)
+              }
+
+              private fun handleShare(i: Intent?) {
+                  if (i?.action == Intent.ACTION_SEND) {
+                      i.getStringExtra(Intent.EXTRA_TEXT)?.let { input.setText(it) }
+                  }
+              }
+
+              private fun say(msg: String) = runOnUiThread { status.text = msg }
+
+              private fun setBusy(b: Boolean) {
+                  busy = b
+                  go.isEnabled = !b
+                  upd.isEnabled = !b
+                  bar.visibility = if (b) View.VISIBLE else View.GONE
+              }
+
+              private fun startDownload() {
+                  if (busy) return
+                  val url = Regex("https?://[^\\s]+").find(input.text.toString())?.value
+                      ?.trimEnd(')', ']', '>', ',', '.')
+                  if (url == null) { say("Paste a valid link first."); return }
+                  if (!ready && !isDouyin(url)) { say("Still preparing the engine. Wait a few seconds and try again."); return }
+                  val wantAudio = audio.isChecked
+                  setBusy(true)
+                  say("Downloading... this can take a minute.")
+
+                  Thread {
+                      try {
+                          val dir = File(getExternalFilesDir(null), "dl")
+                          dir.deleteRecursively()
+                          dir.mkdirs()
+
+                          if (isDouyin(url)) {
+                              fetchDouyin(url, dir, wantAudio)
+                          } else {
+                              val req = YoutubeDLRequest(url)
+                              req.addOption("--no-playlist")
+                              req.addOption("--no-mtime")
+                              req.addOption("-o", dir.absolutePath + "/%(title).60s.%(ext)s")
+                              if (wantAudio) {
+                                  req.addOption("-x")
+                                  req.addOption("--audio-format", "mp3")
+                              } else {
+                                  req.addOption("-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b")
+                                  req.addOption("--merge-output-format", "mp4")
+                              }
+                              YoutubeDL.getInstance().execute(req)
+                          }
+
+                          val f = dir.listFiles()
+                              ?.filter { it.isFile && !it.name.endsWith(".part") }
+                              ?.maxByOrNull { it.lastModified() }
+                              ?: throw Exception("No file was produced.")
+                          saveToDownloads(f)
+                          val name = f.name
+                          f.delete()
+                          say("Saved to Downloads/Downloader:\n$name")
+                      } catch (e: Exception) {
+                          say("Failed: " + (e.message ?: e.toString()).takeLast(400))
+                      } finally {
+                          runOnUiThread { setBusy(false) }
+                      }
+                  }.start()
+              }
+
+              private val mobileUa = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+
+              private fun isDouyin(url: String): Boolean = try {
+                  val h = URL(url).host.lowercase()
+                  h == "douyin.com" || h.endsWith(".douyin.com") || h == "iesdouyin.com" || h.endsWith(".iesdouyin.com")
+              } catch (e: Exception) { false }
+
+              private fun httpGet(urlStr: String): Pair<String, String> {
+                  val c = URL(urlStr).openConnection() as HttpURLConnection
+                  c.connectTimeout = 15000
+                  c.readTimeout = 20000
+                  c.setRequestProperty("User-Agent", mobileUa)
+                  val body = c.inputStream.bufferedReader().use { it.readText() }
+                  return Pair(body, c.url.toString())
+              }
+
+              private fun downloadTo(urlStr: String, out: File) {
+                  var cur = urlStr
+                  for (i in 0 until 6) {
+                      val c = URL(cur).openConnection() as HttpURLConnection
+                      c.instanceFollowRedirects = false
+                      c.connectTimeout = 15000
+                      c.readTimeout = 30000
+                      c.setRequestProperty("User-Agent", mobileUa)
+                      c.setRequestProperty("Referer", "https://www.douyin.com/")
+                      val code = c.responseCode
+                      if (code in 300..399) {
+                          val loc = c.getHeaderField("Location") ?: throw Exception("Bad redirect from Douyin server.")
+                          cur = URL(URL(cur), loc).toString()
+                          c.disconnect()
+                          continue
+                      }
+                      if (code != 200) throw Exception("Douyin server answered HTTP $code.")
+                      c.inputStream.use { inp -> out.outputStream().use { inp.copyTo(it) } }
+                      return
+                  }
+                  throw Exception("Too many redirects.")
+              }
+
+              // Douyin: read the public share page (the page the Douyin app opens) and take the no-watermark file.
+              private fun fetchDouyin(url: String, dir: File, wantAudio: Boolean) {
+                  val idRegex = Regex("/(?:video|note)/(\\d+)")
+                  val id = idRegex.find(url)?.groupValues?.get(1)
+                      ?: idRegex.find(httpGet(url).second)?.groupValues?.get(1)
+                      ?: throw Exception("Could not find the video id in this Douyin link.")
+                  val html = httpGet("https://www.iesdouyin.com/share/video/$id").first
+                  val m = Regex("window\\._ROUTER_DATA\\s*=\\s*(.*?)</script>", RegexOption.DOT_MATCHES_ALL).find(html)
+                      ?: throw Exception("Douyin page format not recognised. The site may have changed or blocked this request.")
+                  val loader = JSONObject(m.groupValues[1].trim().trimEnd(';')).getJSONObject("loaderData")
+                  var item: JSONObject? = null
+                  for (k in loader.keys()) {
+                      val info = loader.optJSONObject(k)?.optJSONObject("videoInfoRes") ?: continue
+                      val list = info.optJSONArray("item_list") ?: continue
+                      if (list.length() > 0) { item = list.getJSONObject(0); break }
+                  }
+                  val data = item ?: throw Exception("No video data found. It may be a private video or blocked.")
+                  val title = data.optString("desc").ifBlank { "douyin_$id" }
+                      .replace(Regex("[\\\\/:*?\"<>|\\r\\n]"), "_").take(60)
+
+                  var mediaUrl: String? = null
+                  var ext = "mp4"
+                  if (wantAudio) {
+                      mediaUrl = data.optJSONObject("music")?.optJSONObject("play_url")?.optJSONArray("url_list")?.optString(0)
+                      if (!mediaUrl.isNullOrBlank()) ext = "mp3"
+                  }
+                  if (mediaUrl.isNullOrBlank()) {
+                      val list = data.optJSONObject("video")?.optJSONObject("play_addr")?.optJSONArray("url_list")
+                          ?: throw Exception("This post has no video (image posts are not supported).")
+                      mediaUrl = list.getString(0).replace("playwm", "play")
+                      ext = "mp4"
+                  }
+                  downloadTo(mediaUrl!!, File(dir, "$title.$ext"))
+              }
+
+              private fun saveToDownloads(f: File) {
+                  val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(f.extension.lowercase())
+                      ?: "application/octet-stream"
+                  val values = ContentValues().apply {
+                      put(MediaStore.MediaColumns.DISPLAY_NAME, f.name)
+                      put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                      put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Downloader")
+                  }
+                  val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                      ?: throw Exception("Could not create file in Downloads.")
+                  contentResolver.openOutputStream(uri)!!.use { out ->
+                      f.inputStream().use { it.copyTo(out) }
+                  }
+              }
+
+              private fun startUpdate() {
+                  if (busy) return
+                  if (!ready) { say("Still preparing the engine. Try again in a moment."); return }
+                  setBusy(true)
+                  say("Updating yt-dlp...")
+                  Thread {
+                      try {
+                          val r = YoutubeDL.getInstance().updateYoutubeDL(applicationContext)
+                          say("Update finished: $r")
+                      } catch (e: Exception) {
+                          say("Update failed: " + (e.message ?: e.toString()).takeLast(300))
+                      } finally {
+                          runOnUiThread { setBusy(false) }
+                      }
+                  }.start()
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoDownloader-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
